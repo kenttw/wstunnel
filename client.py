@@ -3,9 +3,9 @@ import asyncio
 import logging
 import argparse
 import ssl
+import socket
 from urllib.parse import urlencode, urlparse, urlunparse
 import constants
-# https://github.com/aaugustin/websockets
 import websockets
 
 import watchdog as wd
@@ -13,81 +13,79 @@ import watchdog as wd
 logger = logging.getLogger(__name__)
 
 class BaseServer:
-    def __init__(self,
-                 client,
-                 f_write_to_transport,
-                 f_conn_lost,
-                 uri,
-                 certfile,
-                 client_cert,
-                 idle_timeout,
-                 compress,
-                 watchdog_server):
+    def __init__(self, client, f_write_to_transport, f_conn_lost, uri, certfile, client_cert, idle_timeout, compress, watchdog_server, proxy=None):
         self.client = client
         self.done = False
         self.que = asyncio.Queue()
+        self.proxy = proxy
         if uri.startswith('wss://'):
-            ssl_context = ssl.create_default_context(cafile = certfile)
+            ssl_context = ssl.create_default_context(cafile=certfile)
             ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
             if client_cert:
                 ssl_context.load_cert_chain(client_cert)
             ssl_param = {'ssl': ssl_context}
         else:
-            ssl_param = dict()
-        asyncio.create_task(self.new_client(uri,
-                                            ssl_param,
-                                            f_write_to_transport,
-                                            f_conn_lost,
-                                            idle_timeout,
-                                            compress,
-                                            watchdog_server))
-    
+            ssl_param = {}
+        asyncio.create_task(self.new_client(uri, ssl_param, f_write_to_transport, f_conn_lost, idle_timeout, compress, watchdog_server))
+
     def data_received(self, data):
         self.que.put_nowait(memoryview(data))
-    
+
     def shutdown(self):
         self.done = True
         self.que.put_nowait(None)
-    
-    async def new_client(self,
-                         uri,
-                         ssl_param,
-                         f_write_to_transport,
-                         f_conn_lost,
-                         idle_timeout,
-                         compress,
-                         watchdog_server):
+
+    async def new_client(self, uri, ssl_param, f_write_to_transport, f_conn_lost, idle_timeout, compress, watchdog_server):
         tasks = []
         try:
-            async with websockets.connect(uri,
-                                          max_size = constants.WS_MAX_MSG_SIZE_COMP, max_queue = None,
-                                          compression = compress,
-                                          **ssl_param) as ws:
-                if idle_timeout:
-                    watchdog = wd.WatchdogClient(watchdog_server,
-                                                 idle_timeout,
-                                                 wd.IdleTimeout(f"Connection {self.client} has idled"))
-                    tasks.append(watchdog.start())
-                else:
-                    watchdog = None
-                tasks.append(asyncio.create_task(self.ws_data_sender(ws, watchdog)))
-                tasks.append(asyncio.create_task(self.ws_data_receiver(ws, f_write_to_transport, watchdog)))
-                done, _ = await asyncio.wait(tasks, return_when = 'FIRST_COMPLETED')
-                for i in done:
-                    exc = i.exception()
-                    if exc:
-                        raise exc
-        except (wd.IdleTimeout,
-                websockets.exceptions.ConnectionClosedOK) as e:
+            if self.proxy:
+                # Establish a TCP connection to the proxy
+                proxy_host, proxy_port = self.proxy.split(':')
+                proxy_port = int(proxy_port)
+                sock = socket.create_connection((proxy_host, proxy_port))
+
+                # Send the CONNECT request
+                target = urlparse(uri)
+                connect_request = f"CONNECT {target.hostname}:{target.port} HTTP/1.1\r\nHost: {target.hostname}:{target.port}\r\n\r\n"
+                sock.sendall(connect_request.encode('utf-8'))
+
+                # Read the response from the proxy
+                response = sock.recv(4096).decode('utf-8')
+                if "200 Connection established" not in response:
+                    raise ConnectionError(f"Failed to establish a tunnel via proxy. Response: {response}")
+
+                # Upgrade to SSL if necessary
+                if uri.startswith('wss://'):
+                    sock = ssl.wrap_socket(sock, ssl_context=ssl_param.get('ssl'))
+
+                # Use this socket to create a WebSocket connection
+                ws = await websockets.connect(uri, sock=sock, max_size=constants.WS_MAX_MSG_SIZE_COMP, max_queue=None, compression=compress)
+            else:
+                # Direct connection
+                ws = await websockets.connect(uri, max_size=constants.WS_MAX_MSG_SIZE_COMP, max_queue=None, compression=compress, **ssl_param)
+
+            if idle_timeout:
+                watchdog = wd.WatchdogClient(watchdog_server, idle_timeout, wd.IdleTimeout(f"Connection {self.client} has idled"))
+                tasks.append(watchdog.start())
+            else:
+                watchdog = None
+            tasks.append(asyncio.create_task(self.ws_data_sender(ws, watchdog)))
+            tasks.append(asyncio.create_task(self.ws_data_receiver(ws, f_write_to_transport, watchdog)))
+            done, _ = await asyncio.wait(tasks, return_when='FIRST_COMPLETED')
+            for i in done:
+                exc = i.exception()
+                if exc:
+                    raise exc
+        except (wd.IdleTimeout, websockets.exceptions.ConnectionClosedOK) as e:
             logger.info(repr(e))
         except Exception as e:
-            logger.error(repr(e), exc_info = True)
+            logger.error(repr(e), exc_info=True)
         finally:
             for t in tasks:
                 t.cancel()
             if not self.done:
                 f_conn_lost(self.client)
-    
+
     async def ws_data_sender(self, ws, watchdog):
         M = constants.WS_MAX_MSG_SIZE
         que = self.que
@@ -101,22 +99,21 @@ class BaseServer:
             for i in range(0, len(data), M):
                 await ws.send(data[i:i+M])
             que.task_done()
-    
+
     async def ws_data_receiver(self, ws, f_write_to_transport, watchdog):
         async for data in ws:
-            print(data)
             if watchdog:
                 watchdog.reset()
             f_write_to_transport(data, self.client)
 
 class UdpServer:
-    def __init__(self, uri, certfile, client_cert, idle_timeout, compress, watchdog_server):
+    def __init__(self, uri, certfile, client_cert, idle_timeout, compress, watchdog_server, proxy):
         self.base_servers = dict()
-        self.args = [uri, certfile, client_cert, idle_timeout, compress, watchdog_server]
-    
+        self.args = [uri, certfile, client_cert, idle_timeout, compress, watchdog_server, proxy]
+
     def connection_made(self, transport):
         self.transport = transport
-    
+
     def datagram_received(self, data, addr):
         try:
             base = self.base_servers[addr]
@@ -125,25 +122,24 @@ class UdpServer:
             base = self.base_servers[addr] = BaseServer(addr,
                                                         self.transport.sendto,
                                                         self.upstream_lost,
-                                                        *self.args
-                                                       )
+                                                        *self.args)
         base.data_received(data)
-    
+
     def write_to_transport(self, data, addr):
         self.transport.sendto(data, addr)
-    
+
     def upstream_lost(self, addr):
         logger.info(f'Upstream connection for UDP client {addr} is gone')
         self.base_servers.pop(addr)
 
 class TcpServer(asyncio.Protocol):
-    def __init__(self, uri, certfile, client_cert, idle_timeout, compress, watchdog_server):
-        self.args = [uri, certfile, client_cert, idle_timeout, compress, watchdog_server]
+    def __init__(self, uri, certfile, client_cert, idle_timeout, compress, watchdog_server, proxy):
+        self.args = [uri, certfile, client_cert, idle_timeout, compress, watchdog_server, proxy]
         self.peername = None
         self.base = None
         self.transport = None
         super().__init__()
-    
+
     def connection_made(self, transport):
         peername = self.peername = transport.get_extra_info('peername')
         logger.info(f'New TCP connection from {peername}')
@@ -151,19 +147,18 @@ class TcpServer(asyncio.Protocol):
         self.base = BaseServer(peername,
                                self.write_to_transport,
                                self.upstream_lost,
-                               *self.args
-                              )
-    
+                               *self.args)
+
     def data_received(self, data):
         self.base.data_received(data)
-    
+
     def connection_lost(self, exc):
         logger.info(f'TCP connection from {self.peername} is down: {repr(exc)}')
         self.base.shutdown()
-    
+
     def write_to_transport(self, data, addr):
         self.transport.write(data)
-    
+
     def upstream_lost(self, peername):
         self.transport.close()
 
@@ -173,7 +168,7 @@ def get_passwd_from_file(path):
 
 def update_url_with_passwd(url, passwd):
     url = urlparse(url)
-    url = url._replace(query = urlencode({'t': passwd}))
+    url = url._replace(query=urlencode({'t': passwd}))
     return urlunparse(url)
 
 async def main(args):
@@ -195,11 +190,11 @@ async def main(args):
                                                                              args.client_cert,
                                                                              args.idle_timeout,
                                                                              compress,
-                                                                             watchdog_server),
-                                                           local_addr = local_addr
-                                                          )
+                                                                             watchdog_server,
+                                                                             args.proxy),
+                                                           local_addr=local_addr)
         try:
-            await loop.create_future() # Serve forever
+            await loop.create_future()  # Serve forever
         finally:
             transport.close()
     else:
@@ -208,35 +203,28 @@ async def main(args):
                                                             args.client_cert,
                                                             args.idle_timeout,
                                                             compress,
-                                                            watchdog_server),
-                                          local_addr[0], local_addr[1]
-                                         )
+                                                            watchdog_server,
+                                                            args.proxy),
+                                          local_addr[0], local_addr[1])
         async with server:
             await server.serve_forever()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Wstunnel client')
-    parser.add_argument('--url', type=str, metavar='ws[s]://HOSTNAME:PORT/PATH', required=True, help='URL')
+    parser.add_argument('--url', type=str, metavar='ws[s]://HOSTNAME:PORT/PATH', required=True, help='URL of the WebSocket server')
     parser.add_argument('-l', '--listen', type=str, metavar='(tcp|udp)://IP:PORT', required=True, help='Listen address')
     parser.add_argument('-p', '--passwd', type=str, metavar='FILE', help='File containing one line of password to authenticate to the proxy server')
-    parser.add_argument('-i', '--idle-timeout', type=int, default=120, help='Seconds to wait before an idle connection being killed')
+    parser.add_argument('-i', '--idle-timeout', type=int, default=120, help='Seconds to wait before an idle connection is killed')
     parser.add_argument('-s', '--ca-certs', type=str, metavar='ca.pem', help="Server CA certificates in PEM format to verify against")
     parser.add_argument('-c', '--client-cert', type=str, metavar='client.pem', help="Client certificate in PEM format with private key")
     parser.add_argument('--enable-compress', type=bool, const=True, nargs='?', help='Compress data before sending')
     parser.add_argument('--log-file', type=str, metavar='FILE', help='Log to FILE')
     parser.add_argument('--log-level', type=str, default="info", choices=['debug', 'info', 'error', 'critical'], help='Log level')
+    parser.add_argument('--proxy', type=str, metavar='proxy_host:proxy_port', help='HTTP proxy in the format proxy_host:proxy_port')
     args = parser.parse_args()
-    if args.log_level == 'debug':
-        log_level = logging.DEBUG
-    elif args.log_level == 'error':
-        log_level = logging.ERROR
-    elif args.log_level == 'critical':
-        log_level = logging.CRITICAL
-    else:
-        log_level = logging.INFO
+    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     logging_config_param = {'format': '%(levelname)s::%(asctime)s::%(filename)s:%(lineno)d::%(message)s',
-                            'datefmt': '%Y-%m-%d %H:%M:%S'
-                           }
+                            'datefmt': '%Y-%m-%d %H:%M:%S'}
     if args.log_file:
         logging_config_param['filename'] = args.log_file
     logging.basicConfig(**logging_config_param)
