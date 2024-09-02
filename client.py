@@ -104,6 +104,7 @@ class BaseServer:
     
     async def ws_data_receiver(self, ws, f_write_to_transport, watchdog):
         async for data in ws:
+            print(data)
             if watchdog:
                 watchdog.reset()
             f_write_to_transport(data, self.client)
